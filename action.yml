@@ -1,6 +1,6 @@
 name: "Flowz Architecture Preview"
 description: "Scan a repo, enrich it via the Flowz analyzer, and publish an interactive architecture graph on the PR."
-author: "flowz-hq"
+author: "flowzhq"
 branding:
   icon: "git-branch"
   color: "purple"
@@ -18,10 +18,10 @@ branding:
 
 inputs:
   analyzer-image:
-    description: "GHCR ref of the analyzer image, pinned (e.g. ghcr.io/flowz-hq/flowz-analyzer:1.4.0). Private."
+    description: "GHCR ref of the analyzer image, pinned (e.g. ghcr.io/flowzhq/flowz-analyzer:1.4.0). Private."
     required: true
   scanner-image:
-    description: "GHCR OCI artifact of the flowz CLI, pinned (e.g. ghcr.io/flowz-hq/flowz-cli:v0.4.0). Private."
+    description: "GHCR OCI artifact of the flowz CLI, pinned (e.g. ghcr.io/flowzhq/flowz-cli:v0.4.0). Private."
     required: true
   registry-user:
     description: "GHCR username with read:packages on BOTH packages. Pass a secret or vars value."
