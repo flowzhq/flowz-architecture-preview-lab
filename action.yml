@@ -1,0 +1,212 @@
+name: "Flowz Architecture Preview"
+description: "Scan a repo, enrich it via the Flowz analyzer, and publish an interactive architecture graph on the PR."
+author: "flowz-hq"
+branding:
+  icon: "git-branch"
+  color: "purple"
+
+# Composite action: everything runs on the CALLER's runner in one `uses:` step.
+# The private scanner + analyzer are pulled from GHCR with the caller's token
+# (read:packages on both packages) — the token is the access boundary, this
+# public recipe carries no credentials. The analyzer runs as a `docker run`
+# sidecar (an Action can't declare a job-level `services:` container), and the
+# per-service eFSG enrichment is content-addressed + cached so unchanged services
+# skip the analyzer. See flowz-app ADR-026 (distribution) + ADR-023 (analyzer).
+#
+# The CALLER's job must set `permissions: { contents: read, pull-requests: write }`
+# and check out the repo (actions/checkout) before this step.
+
+inputs:
+  analyzer-image:
+    description: "GHCR ref of the analyzer image, pinned (e.g. ghcr.io/flowz-hq/flowz-analyzer:1.4.0). Private."
+    required: true
+  scanner-image:
+    description: "GHCR OCI artifact of the flowz CLI, pinned (e.g. ghcr.io/flowz-hq/flowz-cli:v0.4.0). Private."
+    required: true
+  registry-user:
+    description: "GHCR username with read:packages on BOTH packages. Pass a secret or vars value."
+    required: true
+  registry-token:
+    description: "GHCR read:packages token. Pass a secret."
+    required: true
+  preview-token:
+    description: "Flowz preview publish token — must match the BFF's --preview-token. Pass a secret."
+    required: true
+  app-url:
+    description: "Flowz dashboard base URL for the viewer link."
+    required: false
+    default: "https://app.codeflowz.ai"
+  scan-path:
+    description: "Path to scan (monorepo root)."
+    required: false
+    default: "."
+  comment:
+    description: "Upsert a PR comment with the graph link (true/false)."
+    required: false
+    default: "true"
+
+outputs:
+  view-url:
+    description: "The interactive preview URL (empty if publishing was skipped/failed)."
+    value: ${{ steps.publish.outputs.view_url }}
+
+runs:
+  using: composite
+  steps:
+    - uses: oras-project/setup-oras@v1
+
+    - name: Log in to GHCR
+      shell: bash
+      env:
+        REG_USER: ${{ inputs.registry-user }}
+        REG_TOKEN: ${{ inputs.registry-token }}
+        ANALYZER_IMAGE: ${{ inputs.analyzer-image }}
+      run: |
+        set -euo pipefail
+        host="${ANALYZER_IMAGE%%/*}"
+        echo "$REG_TOKEN" | docker login "$host" -u "$REG_USER" --password-stdin
+        echo "$REG_TOKEN" | oras login "$host" -u "$REG_USER" --password-stdin
+
+    - name: Pull flowz scanner (oras)
+      shell: bash
+      env:
+        SCANNER_IMAGE: ${{ inputs.scanner-image }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/cli" "$HOME/.local/bin"
+        oras pull "$SCANNER_IMAGE" -o "$RUNNER_TEMP/cli"
+        bin=$(ls "$RUNNER_TEMP"/cli/flowz_*_linux_amd64 2>/dev/null | head -1)
+        [ -n "$bin" ] || { echo "::error::no linux/amd64 binary in $SCANNER_IMAGE"; ls -la "$RUNNER_TEMP/cli"; exit 1; }
+        install -m 0755 "$bin" "$HOME/.local/bin/flowz"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/bin/flowz" version || true
+
+    - name: Start analyzer (docker run sidecar)
+      id: analyzer
+      shell: bash
+      env:
+        ANALYZER_IMAGE: ${{ inputs.analyzer-image }}
+      run: |
+        set -euo pipefail
+        docker run -d --name flowz-analyzer -p 3031:3031 "$ANALYZER_IMAGE"
+        # Gateway = the host's IP on the analyzer's docker network — the blob
+        # server (bound 0.0.0.0 on the host) is reachable there from inside the
+        # container. Default bridge is 172.17.0.1; resolve it to be robust.
+        gw=$(docker inspect flowz-analyzer --format '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}')
+        digest=$(docker inspect flowz-analyzer --format '{{.Image}}'); digest="${digest#sha256:}"
+        echo "gateway=${gw:-172.17.0.1}" >> "$GITHUB_OUTPUT"
+        echo "digest=${digest:0:16}" >> "$GITHUB_OUTPUT"
+        for _ in $(seq 1 30); do
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3031/ || true)
+          if [ -n "$code" ] && [ "$code" -lt 500 ]; then echo "analyzer up (GET / -> $code)"; exit 0; fi
+          sleep 2
+        done
+        echo "::error::analyzer never became reachable at http://localhost:3031"; docker logs flowz-analyzer || true; exit 1
+
+    - name: Scan (one FSG per service) + cache key
+      id: scan
+      shell: bash
+      env:
+        SCAN_PATH: ${{ inputs.scan-path }}
+      run: |
+        set -euo pipefail
+        mkdir -p "$RUNNER_TEMP/scans"
+        flowz scan "$SCAN_PATH" --monorepo -o "$RUNNER_TEMP/scans/scan.json"
+        echo "Scanned FSGs:"; ls -la "$RUNNER_TEMP/scans"
+        # Content-address the eFSG cache by each FSG's decompressed-content hash.
+        man=$(for f in "$RUNNER_TEMP"/scans/*.json.gz; do gunzip -c "$f" | sha256sum | cut -d' ' -f1; done | sort | sha256sum | cut -d' ' -f1)
+        echo "manifest=${man:0:32}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore/save eFSG cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/efsg-cache
+        key: flowz-efsg-${{ steps.analyzer.outputs.digest }}-${{ steps.scan.outputs.manifest }}
+        restore-keys: |
+          flowz-efsg-${{ steps.analyzer.outputs.digest }}-
+
+    - name: Enrich (cached) + assemble
+      shell: bash
+      env:
+        ANALYZER_URL: http://localhost:3031
+        BLOB_BACKEND: local
+        LOCAL_BLOB_HOST: ${{ steps.analyzer.outputs.gateway }}
+        LOCAL_BLOB_PORT: "8077"
+      run: |
+        set -euo pipefail
+        CACHE_DIR="$RUNNER_TEMP/efsg-cache" \
+        WORK_DIR="$RUNNER_TEMP/efsg" \
+        OUT="$RUNNER_TEMP/arch-bundle.json" \
+          bash "${{ github.action_path }}/calc-pipeline.sh" "$RUNNER_TEMP/scans"
+
+    - name: Upload architecture bundle
+      id: artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: architecture-graph
+        path: ${{ runner.temp }}/arch-bundle.json
+        if-no-files-found: error
+
+    - name: Publish interactive preview
+      id: publish
+      shell: bash
+      env:
+        APP_URL: ${{ inputs.app-url }}
+        PREVIEW_TOKEN: ${{ inputs.preview-token }}
+      run: |
+        set -euo pipefail
+        base="${APP_URL%/}"
+        resp=$(gzip -c "$RUNNER_TEMP/arch-bundle.json" \
+          | curl -fsS -X POST \
+              -H "Authorization: Bearer $PREVIEW_TOKEN" \
+              -H "Content-Type: application/gzip" \
+              --data-binary @- "$base/internal/v1/preview") \
+          || { echo "::warning::preview publish failed; the comment will link the artifact only"; exit 0; }
+        echo "view_url=$(echo "$resp" | jq -r '.viewUrl // empty')" >> "$GITHUB_OUTPUT"
+        echo "published: $(echo "$resp" | jq -r '.viewUrl // "(no viewUrl)"')"
+
+    - name: Comment architecture graph on PR
+      if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        ARTIFACT_URL: ${{ steps.artifact.outputs.artifact-url }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        VIEW_URL: ${{ steps.publish.outputs.view_url }}
+        SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        bundle="$RUNNER_TEMP/arch-bundle.json"
+        read -r st sym lnk flw <<EOF
+        $(jq -r '"\(.status // "?") \(.graph.symbols|length? // 0) \(.graph.links|length? // 0) \(.flowsList|length? // 0)"' "$bundle")
+        EOF
+
+        link="${ARTIFACT_URL:-$RUN_URL}"
+        view=""
+        if [ -n "${VIEW_URL:-}" ]; then
+          view=$(printf '\n- 🔎 **[Open interactive graph](%s)**' "$VIEW_URL")
+        fi
+
+        body=$(printf '<!-- flowz-arch -->\n## 🗺️ Architecture graph\n\nComputed from this PR'"'"'s code (scan → calc-efsg → calc-system).\n\n- **status:** %s\n- **components:** %s symbols, %s links\n- **flows:** %s\n%s\n- 📦 [Download bundle artifact](%s)\n\n<sub>flowz architecture pipeline · %s</sub>' \
+          "$st" "$sym" "$lnk" "$flw" "$view" "$link" "${SHA:0:8}")
+
+        payload=$(jq -n --arg b "$body" '{body:$b}')
+        api="https://api.github.com/repos/$REPO"
+        auth=(-H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json")
+
+        existing=$(curl -fsS "${auth[@]}" "$api/issues/$PR/comments?per_page=100" \
+          | jq -r 'map(select(.body | startswith("<!-- flowz-arch -->"))) | (.[0].id // empty)')
+        if [ -n "$existing" ]; then
+          curl -fsS -X PATCH "${auth[@]}" -d "$payload" "$api/issues/comments/$existing" >/dev/null
+          echo "updated comment $existing on PR #$PR"
+        else
+          curl -fsS -X POST "${auth[@]}" -d "$payload" "$api/issues/$PR/comments" >/dev/null
+          echo "created comment on PR #$PR"
+        fi
+
+    - name: Stop analyzer
+      if: always()
+      shell: bash
+      run: docker rm -f flowz-analyzer >/dev/null 2>&1 || true
