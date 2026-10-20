@@ -1,4 +1,4 @@
-# flowzhq/arch-preview
+# flowzhq/flowz-architecture-preview-lab
 
 A GitHub composite Action that publishes an **interactive architecture graph** on
 every pull request. One `uses:` step scans the repo, enriches it with the Flowz
@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: flowzhq/arch-preview@v1
+      - uses: flowzhq/flowz-architecture-preview-lab@v1
         with:
           analyzer-image: ghcr.io/flowzhq/flowz-analyzer:1.4.0   # pin the version we gave you
           scanner-image:  ghcr.io/flowzhq/flowz-cli:v0.4.0        # pin the version we gave you
